@@ -1,0 +1,3 @@
+@register_plugin_page("/llmrouter_logs")
+async def log_page(self, request):
+    return await LLMRouterLogPage().get(request)
