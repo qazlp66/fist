@@ -1,0 +1,16 @@
+from astrbot.api.plugin_page import PluginPage
+
+class LLMRouterLogPage(PluginPage):
+    async def get(self, request):
+        # 显示最近 50 条日志的简单 HTML
+        import aiosqlite
+        db = aiosqlite.connect("data/plugins/astrbot_plugin_llm_router/router_log.db")
+        cursor = await db.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT 50")
+        rows = await cursor.fetchall()
+        await db.close()
+
+        html = "<h2>LLM Router 决策日志</h2><table border='1'><tr><th>时间</th><th>用户</th><th>分数</th><th>层级</th><th>模型</th><th>原因</th></tr>"
+        for row in rows:
+            html += f"<tr><td>{row[1]}</td><td>{row[2]}</td><td>{row[4]}</td><td>{row[5]}</td><td>{row[6]}</td><td>{row[8]}</td></tr>"
+        html += "</table>"
+        return self.response(html, content_type="text/html")
