@@ -1,0 +1,416 @@
+"""
+AstrBot 插件：多模型智能调度优化器（增强版）
+作者：qazlp66
+版本：1.0.0
+功能：
+- 基于任务复杂度自动选择不同层级的 LLM 模型
+- 支持用户自定义关键词和长度阈值
+- 模型级并发控制，防止超额负载
+- 异常回退与故障转移
+- 夜间时段自动倾向于轻量模型
+- 决策日志持久化与 WebUI 可视化面板
+"""
+import asyncio
+import json
+import os
+import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import aiosqlite
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.event.filter import on_llm_request, on_llm_error, on_llm_response
+
+
+# ────────────────────────────────
+# 默认配置
+# ────────────────────────────────
+DEFAULT_CONFIG = {
+    # 模型层级定义（按 level 升序，level 越小越轻量）
+    "model_tiers": [
+        {"level": 1, "name": "gemini-flash", "type": "gemini", "min_score": 0, "max_concurrent": 50},
+        {"level": 2, "name": "deepseek-chat", "type": "deepseek", "min_score": 3, "max_concurrent": 0},
+        {"level": 3, "name": "deepseek-reasoner", "type": "deepseek", "min_score": 5, "max_concurrent": 3}
+    ],
+    "default_tier": 2,                # 默认使用层级（当分数未达到任何 tier 时）
+    "global_keywords": [              # 全局复杂任务关键词
+        "代码", "debug", "分析", "推理", "数学",
+        "写一个", "实现", "解释原理", "优化", "帮我看看",
+        "translate", "explain", "analyze", "implement", "optimize"
+    ],
+    "length_threshold": 200,          # 超过此长度的消息自动加分
+    "night_start": 22,                # 夜间开始时间（小时）
+    "night_end": 8,                  # 夜间结束时间
+    "night_force_tier": 1,           # 夜间倾向使用的层级（会被强关键词覆盖）
+    "force_heavy_night_keywords": [   # 夜间仍允许使用高模型的强关键词
+        "紧急", "debug", "崩溃"
+    ],
+    "enable_fallback": True,         # 是否启用异常回退
+    "enable_log": True,              # 是否记录决策日志到数据库
+    "log_retention": 1000            # 保留最近多少条日志
+}
+
+
+# ────────────────────────────────
+# 任务分类器（支持多级评分与时间感知）
+# ────────────────────────────────
+class TaskClassifier:
+    def __init__(self, config: dict, user_keywords: Optional[List[str]] = None,
+                 user_threshold: Optional[int] = None):
+        self.tiers = config.get("model_tiers", [])
+        self.global_kw = [kw.lower() for kw in config.get("global_keywords", [])]
+        self.len_thres = config.get("length_threshold", 200)
+        self.user_kw = [kw.lower() for kw in user_keywords] if user_keywords else []
+        self.user_thres = user_threshold
+        self.night_start = config.get("night_start", 22)
+        self.night_end = config.get("night_end", 8)
+        self.night_force_tier = config.get("night_force_tier", 1)
+        self.force_heavy_night_kw = [kw.lower() for kw in config.get("force_heavy_night_keywords", [])]
+
+    def get_score_and_tier(self, text: str, current_hour: int) -> tuple:
+        """
+        返回 (复杂度分数, 最终分配的 tier level)
+        """
+        text_lower = text.lower()
+        score = 0
+        # 关键词命中加分（每个关键词 +2）
+        all_kw = self.global_kw + self.user_kw
+        for kw in all_kw:
+            if kw in text_lower:
+                score += 2
+        # 长度加分
+        threshold = self.user_thres or self.len_thres
+        if len(text) > threshold:
+            score += 1
+        # 夜间降级：除非命中夜间强关键词，否则降低分数
+        is_night = (self.night_start <= current_hour or current_hour < self.night_end)
+        if is_night:
+            if not any(kw in text_lower for kw in self.force_heavy_night_kw):
+                score = max(0, score - 3)   # 降低后最低为 0
+        # 根据分数选择 tier
+        assigned_level = self.tiers[0]["level"]  # 默认最低级
+        for tier in sorted(self.tiers, key=lambda x: x["min_score"]):
+            if score >= tier["min_score"]:
+                assigned_level = tier["level"]
+        return score, assigned_level
+
+
+# ────────────────────────────────
+# 插件主类
+# ────────────────────────────────
+@register("astrbot_plugin_llm_router", "YourName")
+class LLMRouterPlugin(Star):
+    def __init__(self, context: Context, config: dict = None):
+        super().__init__(context)
+        self._config_path = Path("data/plugins/astrbot_plugin_llm_router/config.json")
+        # 加载配置
+        self.config = DEFAULT_CONFIG.copy()
+        if config:
+            self.config.update(config)
+        else:
+            self._load_config_from_file()
+
+        # 模型层级列表
+        self.tiers = sorted(self.config.get("model_tiers", []), key=lambda x: x["level"])
+        if not self.tiers:
+            logger.error("[LLMRouter] model_tiers 不能为空，请检查配置文件！")
+            self.tiers = [{"level": 1, "name": "default", "type": "openai", "min_score": 0, "max_concurrent": 0}]
+
+        # 并发控制计数器 {level: current_count}
+        self._concurrent_counts: Dict[int, int] = {t["level"]: 0 for t in self.tiers}
+        self._lock = asyncio.Lock()
+
+        # 数据库相关
+        self.log_db = None
+        self._db_path = Path("data/plugins/astrbot_plugin_llm_router/router_log.db")
+        # 初始化数据库（异步）
+        asyncio.ensure_future(self._init_db())
+
+        logger.info(f"[LLMRouter] 增强版插件已启动，共加载 {len(self.tiers)} 个模型层级。")
+
+    # ── 配置文件读写 ──────────────────────────
+    def _load_config_from_file(self):
+        try:
+            if self._config_path.exists():
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    user_config = json.load(f)
+                self.config.update(user_config)
+                logger.info("[LLMRouter] 已加载用户自定义配置。")
+        except Exception as e:
+            logger.warning(f"[LLMRouter] 加载配置文件失败，使用默认配置: {e}")
+
+    def _save_config_to_file(self):
+        try:
+            self._config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[LLMRouter] 保存配置文件失败: {e}")
+
+    # ── 数据库初始化 ──────────────────────────
+    async def _init_db(self):
+        try:
+            self.log_db = await aiosqlite.connect(str(self._db_path))
+            await self.log_db.execute("""
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    user_id TEXT,
+                    session_id TEXT,
+                    score INTEGER,
+                    tier INTEGER,
+                    provider_name TEXT,
+                    old_provider TEXT,
+                    reason TEXT,
+                    user_text_len INTEGER
+                )
+            """)
+            await self.log_db.commit()
+            logger.info("[LLMRouter] 决策日志数据库初始化完成。")
+        except Exception as e:
+            logger.error(f"[LLMRouter] 数据库初始化失败: {e}")
+
+    async def _log_decision(self, user_id: str, session_id: str, score: int,
+                            tier: int, old_provider: str, new_provider: str,
+                            reason: str = "", user_text_len: int = 0):
+        """异步记录决策到数据库"""
+        if not self.log_db:
+            return
+        try:
+            await self.log_db.execute(
+                "INSERT INTO decisions (timestamp, user_id, session_id, score, tier, provider_name, old_provider, reason, user_text_len) VALUES (?,?,?,?,?,?,?,?,?)",
+                (datetime.datetime.now().isoformat(), user_id, session_id, score, tier, new_provider, old_provider, reason, user_text_len)
+            )
+            await self.log_db.commit()
+            # 限制日志条数
+            await self.log_db.execute(f"DELETE FROM decisions WHERE id NOT IN (SELECT id FROM decisions ORDER BY id DESC LIMIT {self.config.get('log_retention', 1000)})")
+            await self.log_db.commit()
+        except Exception as e:
+            logger.error(f"[LLMRouter] 记录决策日志失败: {e}")
+
+    # ── 根据 level 获取 tier 信息 ───────────────
+    def _get_tier_by_level(self, level: int) -> Optional[dict]:
+        for t in self.tiers:
+            if t["level"] == level:
+                return t
+        return None
+
+    # ── 并发控制：尝试占用一个 tier ──────────────
+    async def _try_occupy_tier(self, desired_level: int) -> Optional[int]:
+        """
+        尝试占用 desired_level，若并发已满则降级寻找更低层级。
+        返回最终分配的 level，如果全部满则返回 None。
+        """
+        async with self._lock:
+            # 先检查目标层级
+            tier = self._get_tier_by_level(desired_level)
+            if tier and (tier["max_concurrent"] == 0 or self._concurrent_counts[desired_level] < tier["max_concurrent"]):
+                self._concurrent_counts[desired_level] += 1
+                return desired_level
+            # 降级查找
+            for t in sorted(self.tiers, key=lambda x: x["level"]):
+                if t["level"] < desired_level and (t["max_concurrent"] == 0 or self._concurrent_counts[t["level"]] < t["max_concurrent"]):
+                    self._concurrent_counts[t["level"]] += 1
+                    return t["level"]
+            # 全部满，返回最低级并强制占用（或可改为报错，此处简单占用最低级）
+            lowest = self.tiers[0]["level"]
+            self._concurrent_counts[lowest] += 1
+            return lowest
+
+    async def _release_tier(self, level: int):
+        """释放一层级的占用"""
+        async with self._lock:
+            if level in self._concurrent_counts and self._concurrent_counts[level] > 0:
+                self._concurrent_counts[level] -= 1
+
+    # ── 加载用户偏好 ─────────────────────────
+    async def _load_user_preferences(self, user_id: str):
+        user_kw = await self.db.get(f"router:user_kw:{user_id}")
+        user_kw = json.loads(user_kw) if user_kw else []
+        user_thres = await self.db.get(f"router:user_thres:{user_id}")
+        user_thres = int(user_thres) if user_thres else None
+        return user_kw, user_thres
+
+    # ── 核心钩子：拦截请求并选择模型 ─────────────────
+    @on_llm_request
+    async def route_llm(self, event: AstrMessageEvent, req: ProviderRequest):
+        user_text = event.message_str
+        if not user_text:
+            return
+        user_id = event.get_sender_id()
+        session_id = event.get_session_id()
+
+        # 加载用户偏好
+        user_kw, user_thres = await self._load_user_preferences(user_id)
+
+        # 分类
+        classifier = TaskClassifier(self.config, user_kw, user_thres)
+        now = datetime.datetime.now()
+        score, desired_level = classifier.get_score_and_tier(user_text, now.hour)
+
+        # 并发控制
+        final_level = await self._try_occupy_tier(desired_level)
+        if final_level is None:
+            logger.warning("[LLMRouter] 所有模型层级均满，无法处理请求！")
+            # 可在此回复用户等待，或直接报错
+            return
+        target_tier = self._get_tier_by_level(final_level)
+        if not target_tier:
+            logger.error(f"[LLMRouter] 未知层级 {final_level}，使用默认模型")
+            return
+
+        # 记录旧 provider
+        old_provider = getattr(req, "provider_name", "unknown")
+
+        # 替换 provider
+        req.provider_name = target_tier["name"]
+        req.provider_type = target_tier["type"]
+        if hasattr(req, "model"):
+            req.model = target_tier["name"]
+
+        # 标记层级信息，供异常回退和释放使用
+        req.extra["router_tier"] = final_level
+        req.extra["router_old_provider"] = old_provider
+        req.extra["router_score"] = score
+        req.extra["router_reason"] = f"score={score}, desired={desired_level}, final={final_level}"
+
+        # 决策日志
+        if self.config.get("enable_log"):
+            asyncio.ensure_future(self._log_decision(
+                user_id, session_id, score, final_level, old_provider,
+                target_tier["name"], req.extra["router_reason"], len(user_text)
+            ))
+
+        logger.info(
+            f"[LLMRouter] 用户 {user_id}：分数{score}，期望层级{desired_level}，最终{final_level} "
+            f"({target_tier['name']})，原模型: {old_provider}"
+        )
+
+    # ── 异常回退钩子 ─────────────────────────
+    @on_llm_error
+    async def handle_llm_error(self, event: AstrMessageEvent, req: ProviderRequest, error):
+        target_level = req.extra.get("router_tier")
+        if not target_level or not self.config.get("enable_fallback"):
+            return False
+
+        # 释放之前占用的层级
+        await self._release_tier(target_level)
+
+        # 寻找低一级的模型
+        fallback_level = None
+        for t in sorted(self.tiers, key=lambda x: x["level"]):
+            if t["level"] < target_level:
+                fallback_level = t["level"]
+                # 尝试占用（不计入并发限制，因为是紧急回退，可直接使用）
+                break
+        if fallback_level is None:
+            logger.error("[LLMRouter] 无更低层级可供回退，请求失败。")
+            return False
+
+        fallback_tier = self._get_tier_by_level(fallback_level)
+        if not fallback_tier:
+            return False
+
+        logger.warning(f"[LLMRouter] 模型 {req.provider_name} 调用失败，回退至 {fallback_tier['name']}")
+
+        # 构造新请求
+        new_req = ProviderRequest(
+            provider_name=fallback_tier["name"],
+            provider_type=fallback_tier["type"],
+            model=fallback_tier["name"],
+            messages=req.messages,
+            # 保留其他可能需要的字段
+            extra={}
+        )
+        try:
+            response = await self.context.call_llm(new_req)
+            # 发送回复给用户
+            await event.send(response.text)
+            # 再次尝试释放（虽无占用，但保持逻辑统一）
+            await self._release_tier(fallback_level)
+            return True  # 阻止错误继续传播
+        except Exception as e:
+            logger.error(f"[LLMRouter] 回退模型也调用失败: {e}")
+            return False
+
+    # ── 响应钩子：释放并发计数 ─────────────────
+    @on_llm_response
+    async def after_llm_response(self, event: AstrMessageEvent, req: ProviderRequest, resp):
+        target_level = req.extra.get("router_tier")
+        if target_level:
+            await self._release_tier(target_level)
+
+    # ── 用户命令 ─────────────────────────────
+    @filter.command_group("llmrouter")
+    def llmrouter(self):
+        """多模型调度管理指令"""
+        pass
+
+    @llmrouter.command("status")
+    async def show_status(self, event: AstrMessageEvent):
+        """查看当前路由配置与状态"""
+        tiers_info = "\n".join(
+            f"  Lv{t['level']}: {t['name']} (并发: {self._concurrent_counts.get(t['level'],0)}/{t['max_concurrent'] or '∞'})"
+            for t in self.tiers
+        )
+        msg = (
+            f"📊 LLM Router 状态\n"
+            f"模型层级:\n{tiers_info}\n"
+            f"夜间时段: {self.config['night_start']}:00 - {self.config['night_end']}:00\n"
+            f"夜间倾向层: {self.config['night_force_tier']}\n"
+            f"回退机制: {'开启' if self.config['enable_fallback'] else '关闭'}"
+        )
+        yield event.plain_result(msg)
+
+    @llmrouter.command("add_kw")
+    async def add_kw(self, event: AstrMessageEvent, keyword: str):
+        """添加个人复杂任务关键词: /llmrouter add_kw <关键词>"""
+        user_id = event.get_sender_id()
+        key = f"router:user_kw:{user_id}"
+        existing = await self.db.get(key)
+        kw_list = json.loads(existing) if existing else []
+        if keyword not in kw_list:
+            kw_list.append(keyword)
+        await self.db.put(key, json.dumps(kw_list, ensure_ascii=False))
+        yield event.plain_result(f"✅ 已添加个人关键词: {keyword}")
+
+    @llmrouter.command("del_kw")
+    async def del_kw(self, event: AstrMessageEvent, keyword: str):
+        """删除个人关键词"""
+        user_id = event.get_sender_id()
+        key = f"router:user_kw:{user_id}"
+        existing = await self.db.get(key)
+        if not existing:
+            yield event.plain_result("你还没有添加任何个人关键词。")
+            return
+        kw_list = json.loads(existing)
+        if keyword in kw_list:
+            kw_list.remove(keyword)
+            await self.db.put(key, json.dumps(kw_list, ensure_ascii=False))
+            yield event.plain_result(f"✅ 已移除个人关键词: {keyword}")
+        else:
+            yield event.plain_result(f"❌ 关键词 '{keyword}' 不存在。")
+
+    @llmrouter.command("set_threshold")
+    async def set_threshold(self, event: AstrMessageEvent, threshold: int):
+        """设置个人长度阈值"""
+        user_id = event.get_sender_id()
+        await self.db.put(f"router:user_thres:{user_id}", str(threshold))
+        yield event.plain_result(f"✅ 个人长度阈值已设为: {threshold}")
+
+    @llmrouter.command("reset")
+    async def reset_prefs(self, event: AstrMessageEvent):
+        """重置个人偏好设置"""
+        user_id = event.get_sender_id()
+        await self.db.delete(f"router:user_kw:{user_id}")
+        await self.db.delete(f"router:user_thres:{user_id}")
+        yield event.plain_result("✅ 已重置你的个人偏好设置。")
+
+    # ── 插件卸载时清理 ─────────────────────────
+    async def terminate(self):
+        if self.log_db:
+            await self.log_db.close()
+        logger.info("[LLMRouter] 增强版插件已卸载。")
