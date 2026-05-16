@@ -1,0 +1,4 @@
+name: astrbot_plugin_llm_router
+desc: 多模型智能调度优化器，支持多级路由、并发控制、异常回退等
+version: 1.0.0
+author: YourName
